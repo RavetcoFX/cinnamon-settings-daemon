@@ -22,6 +22,12 @@ enabled_plugins =	\
 
 disabled_plugins = $(NULL)
 
+if BUILD_WACOM
+enabled_plugins += wacom
+else
+disabled_plugins += wacom
+endif
+
 if SMARTCARD_SUPPORT
 enabled_plugins += smartcard
 else

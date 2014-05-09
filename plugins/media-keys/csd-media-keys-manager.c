@@ -39,11 +39,13 @@
 #include <gdk/gdkx.h>
 #include <gtk/gtk.h>
 #include <gio/gdesktopappinfo.h>
+#include <gio/gunixfdlist.h>
 
 #ifdef HAVE_GUDEV
 #include <gudev/gudev.h>
 #endif
 
+#include "mpris-controller.h"
 #include "cinnamon-settings-profile.h"
 #include "csd-marshal.h"
 #include "csd-media-keys-manager.h"
@@ -117,8 +119,12 @@ static const gchar kb_introspection_xml[] =
 #define TOUCHPAD_ENABLED_KEY "touchpad-enabled"
 #define HIGH_CONTRAST "HighContrast"
 
-#define VOLUME_STEP 6           /* percents for one volume button press */
+#define VOLUME_STEP 5           /* percents for one volume button press */
 #define MAX_VOLUME 65536.0
+
+#define SYSTEMD_DBUS_NAME                       "org.freedesktop.login1"
+#define SYSTEMD_DBUS_PATH                       "/org/freedesktop/login1"
+#define SYSTEMD_DBUS_INTERFACE                  "org.freedesktop.login1.Manager"
 
 #define CSD_MEDIA_KEYS_MANAGER_GET_PRIVATE(o) (G_TYPE_INSTANCE_GET_PRIVATE ((o), CSD_TYPE_MEDIA_KEYS_MANAGER, CsdMediaKeysManagerPrivate))
 
@@ -166,6 +172,10 @@ struct CsdMediaKeysManagerPrivate
         GDBusProxy      *power_screen_proxy;
         GDBusProxy      *power_keyboard_proxy;
 
+        /* systemd stuff */
+        GDBusProxy      *logind_proxy;
+        gint             inhibit_keys_fd;
+
         /* Multihead stuff */
         GdkScreen       *current_screen;
         GSList          *screens;
@@ -181,6 +191,8 @@ struct CsdMediaKeysManagerPrivate
         GCancellable    *cancellable;
 
         guint            start_idle_id;
+
+        MprisController *mpris_controller;
 
         /* Ubuntu notifications */
         NotifyNotification *volume_notification;
@@ -696,6 +708,12 @@ static void
 do_logout_action (CsdMediaKeysManager *manager)
 {
         execute (manager, "cinnamon-session-quit --logout", FALSE);
+}
+
+static void
+do_shutdown_action (CsdMediaKeysManager *manager)
+{
+        cinnamon_session_shutdown (manager);
 }
 
 static void
@@ -1277,12 +1295,14 @@ csd_media_player_key_pressed (CsdMediaKeysManager *manager,
         have_listeners = (manager->priv->media_players != NULL);
 
         if (!have_listeners) {
+                if (!mpris_controller_key (manager->priv->mpris_controller, key)) {
                 /* Popup a dialog with an (/) icon */
                 dialog_init (manager);
                 csd_osd_window_set_action_custom (CSD_OSD_WINDOW (manager->priv->dialog),
                                                          "action-unavailable-symbolic",
                                                          FALSE);
                 dialog_show (manager);
+                 }
                 return TRUE;
         }
 
@@ -1451,12 +1471,6 @@ do_toggle_accessibility_key (const char *key)
 }
 
 static void
-do_magnifier_action (CsdMediaKeysManager *manager)
-{
-        do_toggle_accessibility_key ("screen-magnifier-enabled");
-}
-
-static void
 do_screenreader_action (CsdMediaKeysManager *manager)
 {
         do_toggle_accessibility_key ("screen-reader-enabled");
@@ -1503,26 +1517,6 @@ do_text_size_action (CsdMediaKeysManager *manager,
 		g_settings_reset (manager->priv->interface_settings, "text-scaling-factor");
 	else
 		g_settings_set_double (manager->priv->interface_settings, "text-scaling-factor", best);
-}
-
-static void
-do_magnifier_zoom_action (CsdMediaKeysManager *manager,
-			  MediaKeyType         type)
-{
-	GSettings *settings;
-	gdouble offset, value;
-
-	if (type == MAGNIFIER_ZOOM_IN_KEY)
-		offset = 1.0;
-	else
-		offset = -1.0;
-
-	settings = g_settings_new ("org.cinnamon.desktop.a11y.magnifier");
-	value = g_settings_get_double (settings, "mag-factor");
-	value += offset;
-	value = roundl (value);
-	g_settings_set_double (settings, "mag-factor", value);
-	g_object_unref (settings);
 }
 
 static void
@@ -1789,6 +1783,9 @@ do_action (CsdMediaKeysManager *manager,
         case LOGOUT_KEY:
                 do_logout_action (manager);
                 break;
+        case SHUTDOWN_KEY:
+                do_shutdown_action (manager);
+                break;
         case EJECT_KEY:
                 do_eject_action (manager);
                 break;
@@ -1866,9 +1863,6 @@ do_action (CsdMediaKeysManager *manager,
         case ROTATE_VIDEO_KEY:
                 do_video_rotate_action (manager, timestamp);
                 break;
-        case MAGNIFIER_KEY:
-                do_magnifier_action (manager);
-                break;
         case SCREENREADER_KEY:
                 do_screenreader_action (manager);
                 break;
@@ -1878,10 +1872,6 @@ do_action (CsdMediaKeysManager *manager,
 	case INCREASE_TEXT_KEY:
 	case DECREASE_TEXT_KEY:
 		do_text_size_action (manager, type);
-		break;
-	case MAGNIFIER_ZOOM_IN_KEY:
-	case MAGNIFIER_ZOOM_OUT_KEY:
-		do_magnifier_zoom_action (manager, type);
 		break;
 	case TOGGLE_CONTRAST_KEY:
 		do_toggle_contrast_action (manager);
@@ -2094,6 +2084,9 @@ start_media_keys_idle_cb (CsdMediaKeysManager *manager)
         g_free(sound);
         g_object_unref (settings);
 
+        g_debug ("Starting mpris controller");
+        manager->priv->mpris_controller = mpris_controller_new ();
+
         cinnamon_settings_profile_end (NULL);
 
         manager->priv->start_idle_id = 0;
@@ -2196,6 +2189,11 @@ csd_media_keys_manager_stop (CsdMediaKeysManager *manager)
         }
 #endif /* HAVE_GUDEV */
 
+        if (priv->logind_proxy) {
+                g_object_unref (priv->logind_proxy);
+                priv->logind_proxy = NULL;
+        }
+
         if (priv->settings) {
                 g_object_unref (priv->settings);
                 priv->settings = NULL;
@@ -2214,6 +2212,11 @@ csd_media_keys_manager_stop (CsdMediaKeysManager *manager)
         if (priv->power_keyboard_proxy) {
                 g_object_unref (priv->power_keyboard_proxy);
                 priv->power_keyboard_proxy = NULL;
+        }
+
+        if (priv->mpris_controller) {
+                g_object_unref (priv->mpris_controller);
+                priv->mpris_controller = NULL;
         }
 
         if (priv->upower_proxy) {
@@ -2334,9 +2337,85 @@ csd_media_keys_manager_class_init (CsdMediaKeysManagerClass *klass)
 }
 
 static void
+inhibit_done (GObject      *source,
+              GAsyncResult *result,
+              gpointer      user_data)
+{
+        GDBusProxy *proxy = G_DBUS_PROXY (source);
+        CsdMediaKeysManager *manager = CSD_MEDIA_KEYS_MANAGER (user_data);
+        GError *error = NULL;
+        GVariant *res;
+        GUnixFDList *fd_list = NULL;
+        gint idx;
+
+        res = g_dbus_proxy_call_with_unix_fd_list_finish (proxy, &fd_list, result, &error);
+        if (res == NULL) {
+                g_warning ("Unable to inhibit keypresses: %s", error->message);
+                g_error_free (error);
+        } else {
+                g_variant_get (res, "(h)", &idx);
+                manager->priv->inhibit_keys_fd = g_unix_fd_list_get (fd_list, idx, &error);
+                if (manager->priv->inhibit_keys_fd == -1) {
+                        g_warning ("Failed to receive system inhibitor fd: %s", error->message);
+                        g_error_free (error);
+                }
+                g_debug ("System inhibitor fd is %d", manager->priv->inhibit_keys_fd);
+                g_object_unref (fd_list);
+                g_variant_unref (res);
+        }
+}
+
+static void
 csd_media_keys_manager_init (CsdMediaKeysManager *manager)
 {
+        GError *error;
+        GDBusConnection *bus;
+
+        error = NULL;
         manager->priv = CSD_MEDIA_KEYS_MANAGER_GET_PRIVATE (manager);
+
+        bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, &error);
+        if (bus == NULL) {
+                g_warning ("Failed to connect to system bus: %s",
+                           error->message);
+                g_error_free (error);
+                return;
+        }
+
+        manager->priv->logind_proxy =
+                g_dbus_proxy_new_sync (bus,
+                                       0,
+                                       NULL,
+                                       SYSTEMD_DBUS_NAME,
+                                       SYSTEMD_DBUS_PATH,
+                                       SYSTEMD_DBUS_INTERFACE,
+                                       NULL,
+                                       &error);
+
+        if (manager->priv->logind_proxy == NULL) {
+                g_warning ("Failed to connect to systemd: %s",
+                           error->message);
+                g_error_free (error);
+        }
+
+        g_object_unref (bus);
+
+        g_debug ("Adding system inhibitors for power keys");
+        manager->priv->inhibit_keys_fd = -1;
+        g_dbus_proxy_call_with_unix_fd_list (manager->priv->logind_proxy,
+                                             "Inhibit",
+                                             g_variant_new ("(ssss)",
+                                                            "handle-power-key:handle-suspend-key:handle-hibernate-key",
+                                                            g_get_user_name (),
+                                                            "Cinnamon handling keypresses",
+                                                            "block"),
+                                             0,
+                                             G_MAXINT,
+                                             NULL,
+                                             NULL,
+                                             inhibit_done,
+                                             manager);
+
 }
 
 static void
@@ -2351,8 +2430,12 @@ csd_media_keys_manager_finalize (GObject *object)
 
         g_return_if_fail (media_keys_manager->priv != NULL);
 
-        if (media_keys_manager->priv->start_idle_id != 0)
-                g_source_remove (media_keys_manager->priv->start_idle_id);
+        if (media_keys_manager->priv->start_idle_id != 0) {
+            g_source_remove (media_keys_manager->priv->start_idle_id);
+            media_keys_manager->priv->start_idle_id = 0;
+        }
+        if (media_keys_manager->priv->inhibit_keys_fd != -1)
+            close (media_keys_manager->priv->inhibit_keys_fd);
 
         G_OBJECT_CLASS (csd_media_keys_manager_parent_class)->finalize (object);
 }

@@ -1,7 +1,7 @@
 AC_PREREQ([2.60])
 
 AC_INIT([cinnamon-settings-daemon],
-        [2.0.8],
+        [2.2.2],
         [http://bugzilla.gnome.org/enter_bug.cgi?product=cinnamon-settings-daemon])
 
 AC_CONFIG_SRCDIR([cinnamon-settings-daemon/cinnamon-settings-manager.c])
@@ -51,6 +51,8 @@ CINNAMON_DESKTOP_REQUIRED_VERSION=1.0.0
 LIBNOTIFY_REQUIRED_VERSION=0.7.3
 UPOWER_GLIB_REQUIRED_VERSION=0.9.1
 PA_REQUIRED_VERSION=0.9.16
+LIBWACOM_REQUIRED_VERSION=0.7
+LIBRSVG_REQUIRED_VERSION=2.36.2
 UPOWER_REQUIRED_VERSION=0.9.11
 GTK_XINPUT_2_3_VERSION=3.7.8
 
@@ -107,6 +109,14 @@ if test x$have_new_lcms = xyes; then
         AC_DEFINE(HAVE_NEW_LCMS,1,[Got new lcms2])
 else
         PKG_CHECK_MODULES(LCMS, lcms2)
+fi
+
+dnl ---------------------------------------------------------------------------
+dnl - Check for GLib 2.38 or more
+dnl ---------------------------------------------------------------------------
+PKG_CHECK_MODULES(NEW_GLIB, glib-2.0 >= 2.38.0, have_new_glib=yes, have_new_gib=no)
+if test x$have_new_glib = xyes; then
+        AC_DEFINE(HAVE_NEW_GLIB,1,[Got new glib-2.0])
 fi
 
 dnl ---------------------------------------------------------------------------
@@ -245,6 +255,15 @@ dnl - color
 dnl ---------------------------------------------------------------------------
 
 PKG_CHECK_MODULES(COLOR, [colord >= 0.1.9 cinnamon-desktop >= $CINNAMON_DESKTOP_REQUIRED_VERSION libcanberra-gtk3])
+
+dnl ---------------------------------------------------------------------------
+dnl - wacom
+dnl ---------------------------------------------------------------------------
+build_wacom=false
+PKG_CHECK_MODULES(WACOM, [libwacom >= $LIBWACOM_REQUIRED_VERSION x11 xi xtst gudev-1.0 cinnamon-desktop xorg-wacom librsvg-2.0 >= $LIBRSVG_REQUIRED_VERSION gtk+-3.0 >= 3.8.0],
+                  [build_wacom="true" AC_DEFINE(HAVE_WACOM, 1, [Define if wacom is being build])], [build_wacom="false"])
+
+AM_CONDITIONAL(BUILD_WACOM, test "x$build_wacom" = "xtrue")
 
 dnl ==============================================
 dnl smartcard section
@@ -524,6 +543,7 @@ plugins/print-notifications/Makefile
 plugins/screensaver-proxy/Makefile
 plugins/smartcard/Makefile
 plugins/sound/Makefile
+plugins/wacom/Makefile
 plugins/xrandr/Makefile
 plugins/xsettings/Makefile
 data/Makefile
@@ -538,6 +558,7 @@ data/org.cinnamon.settings-daemon.plugins.media-keys.gschema.xml.in
 data/org.cinnamon.settings-daemon.peripherals.gschema.xml.in
 data/org.cinnamon.settings-daemon.plugins.housekeeping.gschema.xml.in
 data/org.cinnamon.settings-daemon.plugins.orientation.gschema.xml.in
+data/org.cinnamon.settings-daemon.peripherals.wacom.gschema.xml.in
 data/org.cinnamon.settings-daemon.plugins.xrandr.gschema.xml.in
 data/org.cinnamon.settings-daemon.plugins.print-notifications.gschema.xml.in
 po/Makefile.in
@@ -573,6 +594,8 @@ echo "
         Session tracking:         ${SESSION_TRACKING}
         LCMS DICT support:        ${have_new_lcms}
         Libnotify support:        ${have_libnotify}
+
+        Wacom support:            ${build_wacom}
 
         Smartcard support:        ${have_smartcard_support}
         Cups support:             ${enable_cups}

@@ -32,6 +32,9 @@
 #include <libupower-glib/upower.h>
 #include <libnotify/notify.h>
 #include <canberra-gtk.h>
+#include <gio/gunixfdlist.h>
+
+#include <X11/extensions/dpms.h>
 
 #define GNOME_DESKTOP_USE_UNSTABLE_API
 #include <libcinnamon-desktop/gnome-rr.h>
@@ -75,8 +78,11 @@
 #define CSD_POWER_MANAGER_NOTIFY_TIMEOUT_LONG           30 * 1000 /* ms */
 
 #define CSD_POWER_MANAGER_CRITICAL_ALERT_TIMEOUT        5 /* seconds */
-#define CSD_POWER_MANAGER_RECALL_DELAY                  30 /* seconds */
 #define CSD_POWER_MANAGER_LID_CLOSE_SAFETY_TIMEOUT      30 /* seconds */
+
+#define SYSTEMD_DBUS_NAME                       "org.freedesktop.login1"
+#define SYSTEMD_DBUS_PATH                       "/org/freedesktop/login1"
+#define SYSTEMD_DBUS_INTERFACE                  "org.freedesktop.login1.Manager"
 
 /* Keep this in sync with gnome-shell */
 #define SCREENSAVER_FADE_TIME                           10 /* seconds */
@@ -170,6 +176,8 @@ struct CsdPowerManagerPrivate
         GCancellable            *bus_cancellable;
         GDBusProxy              *upower_proxy;
         GDBusProxy              *upower_kdb_proxy;
+        gboolean				backlight_helper_force;
+        gchar*                  backlight_helper_preference_args;
         gint                     kbd_brightness_now;
         gint                     kbd_brightness_max;
         gint                     kbd_brightness_old;
@@ -202,6 +210,13 @@ struct CsdPowerManagerPrivate
         GtkStatusIcon           *status_icon;
         guint                    xscreensaver_watchdog_timer_id;
         gboolean                 is_virtual_machine;
+
+        /* systemd stuff */
+        GDBusProxy              *logind_proxy;
+        gint                     inhibit_lid_switch_fd;
+        gboolean                 inhibit_lid_switch_taken;
+        gint                     inhibit_suspend_fd;
+        gboolean                 inhibit_suspend_taken;
 };
 
 enum {
@@ -254,7 +269,11 @@ play_loop_stop (CsdPowerManager *manager)
                 return FALSE;
         }
 
-        g_source_remove (manager->priv->critical_alert_timeout_id);
+        if (manager->priv->critical_alert_timeout_id) {
+            g_source_remove (manager->priv->critical_alert_timeout_id);
+            manager->priv->critical_alert_timeout_id = 0;
+        }
+        
         ca_proplist_destroy (manager->priv->critical_alert_loop_props);
 
         manager->priv->critical_alert_loop_props = NULL;
@@ -930,146 +949,9 @@ out:
         return device;
 }
 
-typedef struct {
-        CsdPowerManager *manager;
-        UpDevice        *device;
-} CsdPowerManagerRecallData;
-
-static void
-device_perhaps_recall_response_cb (GtkDialog *dialog,
-                                   gint response_id,
-                                   CsdPowerManagerRecallData *recall_data)
-{
-        GdkScreen *screen;
-        GtkWidget *dialog_error;
-        GError *error = NULL;
-        gboolean ret;
-        gchar *website = NULL;
-
-        /* don't show this again */
-        if (response_id == GTK_RESPONSE_CANCEL) {
-                g_settings_set_boolean (recall_data->manager->priv->settings,
-                                        "notify-perhaps-recall",
-                                        FALSE);
-                goto out;
-        }
-
-        /* visit recall website */
-        if (response_id == GTK_RESPONSE_OK) {
-
-                g_object_get (recall_data->device,
-                              "recall-url", &website,
-                              NULL);
-
-                screen = gdk_screen_get_default();
-                ret = gtk_show_uri (screen,
-                                    website,
-                                    gtk_get_current_event_time (),
-                                    &error);
-                if (!ret) {
-                        dialog_error = gtk_message_dialog_new (NULL,
-                                                               GTK_DIALOG_MODAL,
-                                                               GTK_MESSAGE_INFO,
-                                                               GTK_BUTTONS_OK,
-                                                               "Failed to show url %s",
-                                                               error->message);
-                        gtk_dialog_run (GTK_DIALOG (dialog_error));
-                        g_error_free (error);
-                }
-        }
-out:
-        gtk_widget_destroy (GTK_WIDGET (dialog));
-        g_object_unref (recall_data->device);
-        g_object_unref (recall_data->manager);
-        g_free (recall_data);
-        g_free (website);
-        return;
-}
-
-static gboolean
-device_perhaps_recall_delay_cb (gpointer user_data)
-{
-        gchar *vendor;
-        const gchar *title = NULL;
-        GString *message = NULL;
-        GtkWidget *dialog;
-        CsdPowerManagerRecallData *recall_data = (CsdPowerManagerRecallData *) user_data;
-
-        g_object_get (recall_data->device,
-                      "recall-vendor", &vendor,
-                      NULL);
-
-        /* TRANSLATORS: the battery may be recalled by its vendor */
-        title = _("Battery may be recalled");
-        message = g_string_new ("");
-        g_string_append_printf (message,
-                                _("A battery in your computer may have been "
-                                  "recalled by %s and you may be at risk."), vendor);
-        g_string_append (message, "\n\n");
-        g_string_append (message, _("For more information visit the battery recall website."));
-        dialog = gtk_message_dialog_new_with_markup (NULL,
-                                                     GTK_DIALOG_DESTROY_WITH_PARENT,
-                                                     GTK_MESSAGE_INFO,
-                                                     GTK_BUTTONS_CLOSE,
-                                                     "<span size='larger'><b>%s</b></span>",
-                                                     title);
-        gtk_message_dialog_format_secondary_markup (GTK_MESSAGE_DIALOG (dialog),
-                                                    "%s", message->str);
-
-        /* TRANSLATORS: button text, visit the manufacturers recall website */
-        gtk_dialog_add_button (GTK_DIALOG (dialog), _("Visit recall website"),
-                               GTK_RESPONSE_OK);
-
-        /* TRANSLATORS: button text, do not show this bubble again */
-        gtk_dialog_add_button (GTK_DIALOG (dialog), _("Do not show me this again"),
-                               GTK_RESPONSE_CANCEL);
-
-        gtk_widget_show (dialog);
-        g_signal_connect (dialog, "response",
-                          G_CALLBACK (device_perhaps_recall_response_cb),
-                          recall_data);
-
-        g_string_free (message, TRUE);
-        g_free (vendor);
-        return FALSE;
-}
-
-static void
-device_perhaps_recall (CsdPowerManager *manager, UpDevice *device)
-{
-        gboolean ret;
-        guint timer_id;
-        CsdPowerManagerRecallData *recall_data;
-
-        /* don't show when running under GDM */
-        if (g_getenv ("RUNNING_UNDER_GDM") != NULL) {
-                g_debug ("running under gdm, so no notification");
-                return;
-        }
-
-        /* already shown, and dismissed */
-        ret = g_settings_get_boolean (manager->priv->settings,
-                                      "notify-perhaps-recall");
-        if (!ret) {
-                g_debug ("settings prevents recall notification");
-                return;
-        }
-
-        recall_data = g_new0 (CsdPowerManagerRecallData, 1);
-        recall_data->manager = g_object_ref (manager);
-        recall_data->device = g_object_ref (device);
-
-        /* delay by a few seconds so the session can load */
-        timer_id = g_timeout_add_seconds (CSD_POWER_MANAGER_RECALL_DELAY,
-                                          device_perhaps_recall_delay_cb,
-                                          recall_data);
-        g_source_set_name_by_id (timer_id, "[CsdPowerManager] perhaps-recall");
-}
-
 static void
 engine_device_add (CsdPowerManager *manager, UpDevice *device)
 {
-        gboolean recall_notice;
         CsdPowerManagerWarning warning;
         UpDeviceState state;
         UpDeviceKind kind;
@@ -1085,7 +967,6 @@ engine_device_add (CsdPowerManager *manager, UpDevice *device)
         g_object_get (device,
                       "kind", &kind,
                       "state", &state,
-                      "recall-notice", &recall_notice,
                       NULL);
 
         /* add old state for transitions */
@@ -1109,43 +990,6 @@ engine_device_add (CsdPowerManager *manager, UpDevice *device)
                                    "engine-state-old",
                                    GUINT_TO_POINTER(state));
         }
-
-        /* the device is recalled */
-        if (recall_notice)
-                device_perhaps_recall (manager, device);
-}
-
-static gboolean
-engine_check_recall (CsdPowerManager *manager, UpDevice *device)
-{
-        UpDeviceKind kind;
-        gboolean recall_notice = FALSE;
-        gchar *recall_vendor = NULL;
-        gchar *recall_url = NULL;
-
-        /* get device properties */
-        g_object_get (device,
-                      "kind", &kind,
-                      "recall-notice", &recall_notice,
-                      "recall-vendor", &recall_vendor,
-                      "recall-url", &recall_url,
-                      NULL);
-
-        /* not battery */
-        if (kind != UP_DEVICE_KIND_BATTERY)
-                goto out;
-
-        /* no recall data */
-        if (!recall_notice)
-                goto out;
-
-        /* emit signal for manager */
-        g_debug ("** EMIT: perhaps-recall");
-        g_debug ("%s-%s", recall_vendor, recall_url);
-out:
-        g_free (recall_vendor);
-        g_free (recall_url);
-        return recall_notice;
 }
 
 static gboolean
@@ -1154,9 +998,10 @@ engine_coldplug (CsdPowerManager *manager)
         guint i;
         GPtrArray *array = NULL;
         UpDevice *device;
+#if ! UP_CHECK_VERSION(0,99,0)
         gboolean ret;
         GError *error = NULL;
-
+ 
         /* get devices from UPower */
         ret = up_client_enumerate_devices_sync (manager->priv->up_client, NULL, &error);
         if (!ret) {
@@ -1164,6 +1009,7 @@ engine_coldplug (CsdPowerManager *manager)
                 g_error_free (error);
                 goto out;
         }
+#endif
 
         /* connected mobile phones */
         gpm_phone_coldplug (manager->priv->phone);
@@ -1175,9 +1021,10 @@ engine_coldplug (CsdPowerManager *manager)
         for (i = 0; array != NULL && i < array->len; i++) {
                 device = g_ptr_array_index (array, i);
                 engine_device_add (manager, device);
-                engine_check_recall (manager, device);
         }
+#if ! UP_CHECK_VERSION(0,99,0)
 out:
+#endif
         if (array != NULL)
                 g_ptr_array_unref (array);
         /* never repeat */
@@ -1189,12 +1036,24 @@ engine_device_added_cb (UpClient *client, UpDevice *device, CsdPowerManager *man
 {
         /* add to list */
         g_ptr_array_add (manager->priv->devices_array, g_object_ref (device));
-        engine_check_recall (manager, device);
-
         engine_recalculate_state (manager);
 }
 
 static void
+#if UP_CHECK_VERSION(0,99,0)
+engine_device_removed_cb (UpClient *client, const char *object_path, CsdPowerManager *manager)
+ {
+        guint i;
+
+        for (i = 0; i < manager->priv->devices_array->len; i++) {
+                UpDevice *device = g_ptr_array_index (manager->priv->devices_array, i);
+
+                if (g_strcmp0 (object_path, up_device_get_object_path (device)) == 0) {
+                        g_ptr_array_remove_index (manager->priv->devices_array, i);
+                        break;
+                }
+        }
+#else
 engine_device_removed_cb (UpClient *client, UpDevice *device, CsdPowerManager *manager)
 {
         gboolean ret;
@@ -1202,6 +1061,7 @@ engine_device_removed_cb (UpClient *client, UpDevice *device, CsdPowerManager *m
         if (!ret)
                 return;
         engine_recalculate_state (manager);
+#endif
 }
 
 static void
@@ -1306,12 +1166,17 @@ manager_critical_action_get (CsdPowerManager *manager,
 
         policy = g_settings_get_enum (manager->priv->settings, "critical-battery-action");
         if (policy == CSD_POWER_ACTION_SUSPEND) {
-                if (is_ups == FALSE &&
-                    up_client_get_can_suspend (manager->priv->up_client))
+                if (is_ups == FALSE
+#if ! UP_CHECK_VERSION(0,99,0)
+                    && up_client_get_can_suspend (manager->priv->up_client)
+#endif
+                )
                         return policy;
                 return CSD_POWER_ACTION_SHUTDOWN;
         } else if (policy == CSD_POWER_ACTION_HIBERNATE) {
+#if ! UP_CHECK_VERSION(0,99,0)
                 if (up_client_get_can_hibernate (manager->priv->up_client))
+#endif
                         return policy;
                 return CSD_POWER_ACTION_SHUTDOWN;
         }
@@ -2303,6 +2168,7 @@ suspend_with_lid_closed (CsdPowerManager *manager)
         /* check we won't melt when the lid is closed */
         if (action_type != CSD_POWER_ACTION_SUSPEND &&
             action_type != CSD_POWER_ACTION_HIBERNATE) {
+#if ! UP_CHECK_VERSION(0,99,0)
                 if (up_client_get_lid_force_sleep (manager->priv->up_client)) {
                         g_warning ("to prevent damage, now forcing suspend");
                         do_power_action_type (manager, CSD_POWER_ACTION_SUSPEND);
@@ -2311,6 +2177,9 @@ suspend_with_lid_closed (CsdPowerManager *manager)
                         /* maybe lock the screen if the lid is closed */
                         lock_screensaver (manager);
                 }
+#else
+                lock_screensaver (manager);
+#endif
         }
 
         /* ensure we turn the panel back on after resume */
@@ -2363,7 +2232,11 @@ do_lid_closed_action (CsdPowerManager *manager)
 
 
 static void
+#if UP_CHECK_VERSION(0,99,0)
+lid_state_changed_cb (UpClient *client, GParamSpec *pspec, CsdPowerManager *manager)
+#else
 up_client_changed_cb (UpClient *client, CsdPowerManager *manager)
+#endif
 {
         gboolean tmp;
 
@@ -2443,6 +2316,43 @@ out:
         return output;
 }
 
+static void
+backlight_override_settings_refresh (CsdPowerManager *manager)
+{
+        int i = 0;
+        /* update all the stored backlight override properties
+         * this is called on startup and by engine_settings_key_changed_cb */
+        manager->priv->backlight_helper_force = g_settings_get_boolean
+                        (manager->priv->settings, "backlight-helper-force");
+
+        /* concatenate all the search preferences into a single argument string */
+        gchar** backlight_preference_order = g_settings_get_strv
+                (manager->priv->settings, "backlight-helper-preference-order");
+
+        gchar* tmp1 = NULL;
+        gchar* tmp2 = NULL;
+
+        if (backlight_preference_order[0] != NULL) {
+                tmp1 = g_strdup_printf("-b %s", backlight_preference_order[0]);
+        }
+
+        for (i=1; backlight_preference_order[i] != NULL; i++ )
+        {
+                tmp2 = tmp1;
+                tmp1 = g_strdup_printf("%s -b %s", tmp2,
+                                backlight_preference_order[i]);
+                g_free(tmp2);
+        }
+
+        tmp2 = manager->priv->backlight_helper_preference_args;
+        manager->priv->backlight_helper_preference_args = tmp1;
+        g_free(tmp2);
+        tmp2 = NULL;
+
+        g_free(backlight_preference_order);
+        backlight_preference_order = NULL;
+}
+
 /**
  * backlight_helper_get_value:
  *
@@ -2452,7 +2362,8 @@ out:
  * for failure. If -1 then @error is set.
  **/
 static gint64
-backlight_helper_get_value (const gchar *argument, GError **error)
+backlight_helper_get_value (const gchar *argument, CsdPowerManager* manager,
+                GError **error)
 {
         gboolean ret;
         gchar *stdout_data = NULL;
@@ -2471,8 +2382,9 @@ backlight_helper_get_value (const gchar *argument, GError **error)
 #endif
 
         /* get the data */
-        command = g_strdup_printf (LIBEXECDIR "/csd-backlight-helper --%s",
-                                   argument);
+        command = g_strdup_printf (LIBEXECDIR "/csd-backlight-helper --%s %s",
+                                   argument,
+                                   manager->priv->backlight_helper_preference_args);
         ret = g_spawn_command_line_sync (command,
                                          &stdout_data,
                                          NULL,
@@ -2543,6 +2455,7 @@ out:
 static gboolean
 backlight_helper_set_value (const gchar *argument,
                             gint value,
+                            CsdPowerManager* manager,
                             GError **error)
 {
         gboolean ret;
@@ -2559,8 +2472,9 @@ backlight_helper_set_value (const gchar *argument,
 #endif
 
         /* get the data */
-        command = g_strdup_printf ("pkexec " LIBEXECDIR "/csd-backlight-helper --%s %i",
-                                   argument, value);
+        command = g_strdup_printf ("pkexec " LIBEXECDIR "/csd-backlight-helper --%s %i %s",
+                                   argument, value,
+                                   manager->priv->backlight_helper_preference_args);
         ret = g_spawn_command_line_sync (command,
                                          NULL,
                                          NULL,
@@ -2582,15 +2496,19 @@ backlight_get_abs (CsdPowerManager *manager, GError **error)
 {
         GnomeRROutput *output;
 
-        /* prefer xbacklight */
-        output = get_primary_output (manager);
-        if (output != NULL) {
-                return gnome_rr_output_get_backlight (output,
-                                                      error);
+        /* prioritize user override settings */
+        if (!manager->priv->backlight_helper_force)
+        {
+                /* prefer xbacklight */
+                output = get_primary_output (manager);
+                if (output != NULL) {
+                        return gnome_rr_output_get_backlight (output,
+                                                              error);
+                }
         }
 
         /* fall back to the polkit helper */
-        return backlight_helper_get_value ("get-brightness", error);
+        return backlight_helper_get_value ("get-brightness", manager, error);
 }
 
 static gint
@@ -2602,24 +2520,28 @@ backlight_get_percentage (CsdPowerManager *manager, GError **error)
         gint min = 0;
         gint max;
 
-        /* prefer xbacklight */
-        output = get_primary_output (manager);
-        if (output != NULL) {
+        /* prioritize user override settings */
+        if (!manager->priv->backlight_helper_force)
+        {
+                /* prefer xbacklight */
+                output = get_primary_output (manager);
+                if (output != NULL) {
 
-                min = gnome_rr_output_get_backlight_min (output);
-                max = gnome_rr_output_get_backlight_max (output);
-                now = gnome_rr_output_get_backlight (output, error);
-                if (now < 0)
+                        min = gnome_rr_output_get_backlight_min (output);
+                        max = gnome_rr_output_get_backlight_max (output);
+                        now = gnome_rr_output_get_backlight (output, error);
+                        if (now < 0)
+                                goto out;
+                        value = ABS_TO_PERCENTAGE (min, max, now);
                         goto out;
-                value = ABS_TO_PERCENTAGE (min, max, now);
-                goto out;
+                }
         }
 
         /* fall back to the polkit helper */
-        max = backlight_helper_get_value ("get-max-brightness", error);
+        max = backlight_helper_get_value ("get-max-brightness", manager, error);
         if (max < 0)
                 goto out;
-        now = backlight_helper_get_value ("get-brightness", error);
+        now = backlight_helper_get_value ("get-brightness", manager, error);
         if (now < 0)
                 goto out;
         value = ABS_TO_PERCENTAGE (min, max, now);
@@ -2630,10 +2552,15 @@ out:
 static gint
 backlight_get_min (CsdPowerManager *manager)
 {
+        /* if we have no xbacklight device, then hardcode zero as sysfs
+        * offsets everything to 0 as min */
+
+        /* user override means we will be using sysfs */
+        if (manager->priv->backlight_helper_force)
+                return 0;
+
         GnomeRROutput *output;
 
-        /* if we have no xbacklight device, then hardcode zero as sysfs
-         * offsets everything to 0 as min */
         output = get_primary_output (manager);
         if (output == NULL)
                 return 0;
@@ -2648,21 +2575,25 @@ backlight_get_max (CsdPowerManager *manager, GError **error)
         gint value;
         GnomeRROutput *output;
 
-        /* prefer xbacklight */
-        output = get_primary_output (manager);
-        if (output != NULL) {
-                value = gnome_rr_output_get_backlight_max (output);
-                if (value < 0) {
-                        g_set_error (error,
-                                     CSD_POWER_MANAGER_ERROR,
-                                     CSD_POWER_MANAGER_ERROR_FAILED,
-                                     "failed to get backlight max");
+        /* prioritize user override settings */
+        if (!manager->priv->backlight_helper_force)
+        {
+                /* prefer xbacklight */
+                output = get_primary_output (manager);
+                if (output != NULL) {
+                        value = gnome_rr_output_get_backlight_max (output);
+                        if (value < 0) {
+                                g_set_error (error,
+                                             CSD_POWER_MANAGER_ERROR,
+                                             CSD_POWER_MANAGER_ERROR_FAILED,
+                                             "failed to get backlight max");
+                        }
+                        return value;
                 }
-                return value;
         }
 
         /* fall back to the polkit helper */
-        return  backlight_helper_get_value ("get-max-brightness", error);
+        return  backlight_helper_get_value ("get-max-brightness", manager, error);
 }
 
 static void
@@ -2699,29 +2630,34 @@ backlight_set_percentage (CsdPowerManager *manager,
         gint max;
         guint discrete;
 
-        /* prefer xbacklight */
-        output = get_primary_output (manager);
-        if (output != NULL) {
-                min = gnome_rr_output_get_backlight_min (output);
-                max = gnome_rr_output_get_backlight_max (output);
-                if (min < 0 || max < 0) {
-                        g_warning ("no xrandr backlight capability");
+        /* prioritize user override settings */
+        if (!manager->priv->backlight_helper_force)
+        {
+                /* prefer xbacklight */
+                output = get_primary_output (manager);
+                if (output != NULL) {
+                        min = gnome_rr_output_get_backlight_min (output);
+                        max = gnome_rr_output_get_backlight_max (output);
+                        if (min < 0 || max < 0) {
+                                g_warning ("no xrandr backlight capability");
+                                goto out;
+                        }
+                        discrete = PERCENTAGE_TO_ABS (min, max, value);
+                        ret = gnome_rr_output_set_backlight (output,
+                                                             discrete,
+                                                             error);
                         goto out;
                 }
-                discrete = PERCENTAGE_TO_ABS (min, max, value);
-                ret = gnome_rr_output_set_backlight (output,
-                                                     discrete,
-                                                     error);
-                goto out;
         }
 
         /* fall back to the polkit helper */
-        max = backlight_helper_get_value ("get-max-brightness", error);
+        max = backlight_helper_get_value ("get-max-brightness", manager, error);
         if (max < 0)
                 goto out;
         discrete = PERCENTAGE_TO_ABS (min, max, value);
         ret = backlight_helper_set_value ("set-brightness",
                                           discrete,
+                                          manager,
                                           error);
 out:
         if (ret && emit_changed)
@@ -2742,45 +2678,50 @@ backlight_step_up (CsdPowerManager *manager, GError **error)
         guint discrete;
         GnomeRRCrtc *crtc;
 
-        /* prefer xbacklight */
-        output = get_primary_output (manager);
-        if (output != NULL) {
+        /* prioritize user override settings */
+        if (!manager->priv->backlight_helper_force)
+        {
+                /* prefer xbacklight */
+                output = get_primary_output (manager);
+                if (output != NULL) {
 
-                crtc = gnome_rr_output_get_crtc (output);
-                if (crtc == NULL) {
-                        g_set_error (error,
-                                     CSD_POWER_MANAGER_ERROR,
-                                     CSD_POWER_MANAGER_ERROR_FAILED,
-                                     "no crtc for %s",
-                                     gnome_rr_output_get_name (output));
+                        crtc = gnome_rr_output_get_crtc (output);
+                        if (crtc == NULL) {
+                                g_set_error (error,
+                                             CSD_POWER_MANAGER_ERROR,
+                                             CSD_POWER_MANAGER_ERROR_FAILED,
+                                             "no crtc for %s",
+                                             gnome_rr_output_get_name (output));
+                                goto out;
+                        }
+                        min = gnome_rr_output_get_backlight_min (output);
+                        max = gnome_rr_output_get_backlight_max (output);
+                        now = gnome_rr_output_get_backlight (output, error);
+                        if (now < 0)
+                               goto out;
+                        step = BRIGHTNESS_STEP_AMOUNT (max - min + 1);
+                        discrete = MIN (now + step, max);
+                        ret = gnome_rr_output_set_backlight (output,
+                                                             discrete,
+                                                             error);
+                        if (ret)
+                                percentage_value = ABS_TO_PERCENTAGE (min, max, discrete);
                         goto out;
                 }
-                min = gnome_rr_output_get_backlight_min (output);
-                max = gnome_rr_output_get_backlight_max (output);
-                now = gnome_rr_output_get_backlight (output, error);
-                if (now < 0)
-                       goto out;
-                step = BRIGHTNESS_STEP_AMOUNT (max - min + 1);
-                discrete = MIN (now + step, max);
-                ret = gnome_rr_output_set_backlight (output,
-                                                     discrete,
-                                                     error);
-                if (ret)
-                        percentage_value = ABS_TO_PERCENTAGE (min, max, discrete);
-                goto out;
         }
 
         /* fall back to the polkit helper */
-        now = backlight_helper_get_value ("get-brightness", error);
+        now = backlight_helper_get_value ("get-brightness", manager, error);
         if (now < 0)
                 goto out;
-        max = backlight_helper_get_value ("get-max-brightness", error);
+        max = backlight_helper_get_value ("get-max-brightness", manager, error);
         if (max < 0)
                 goto out;
         step = BRIGHTNESS_STEP_AMOUNT (max - min + 1);
         discrete = MIN (now + step, max);
         ret = backlight_helper_set_value ("set-brightness",
                                           discrete,
+                                          manager,
                                           error);
         if (ret)
                 percentage_value = ABS_TO_PERCENTAGE (min, max, discrete);
@@ -2803,45 +2744,50 @@ backlight_step_down (CsdPowerManager *manager, GError **error)
         guint discrete;
         GnomeRRCrtc *crtc;
 
-        /* prefer xbacklight */
-        output = get_primary_output (manager);
-        if (output != NULL) {
+        /* prioritize user override settings */
+        if (!manager->priv->backlight_helper_force)
+        {
+                /* prefer xbacklight */
+                output = get_primary_output (manager);
+                if (output != NULL) {
 
-                crtc = gnome_rr_output_get_crtc (output);
-                if (crtc == NULL) {
-                        g_set_error (error,
-                                     CSD_POWER_MANAGER_ERROR,
-                                     CSD_POWER_MANAGER_ERROR_FAILED,
-                                     "no crtc for %s",
-                                     gnome_rr_output_get_name (output));
+                        crtc = gnome_rr_output_get_crtc (output);
+                        if (crtc == NULL) {
+                                g_set_error (error,
+                                             CSD_POWER_MANAGER_ERROR,
+                                             CSD_POWER_MANAGER_ERROR_FAILED,
+                                             "no crtc for %s",
+                                             gnome_rr_output_get_name (output));
+                                goto out;
+                        }
+                        min = gnome_rr_output_get_backlight_min (output);
+                        max = gnome_rr_output_get_backlight_max (output);
+                        now = gnome_rr_output_get_backlight (output, error);
+                        if (now < 0)
+                               goto out;
+                        step = BRIGHTNESS_STEP_AMOUNT (max - min + 1);
+                        discrete = MAX (now - step, 0);
+                        ret = gnome_rr_output_set_backlight (output,
+                                                             discrete,
+                                                             error);
+                        if (ret)
+                                percentage_value = ABS_TO_PERCENTAGE (min, max, discrete);
                         goto out;
                 }
-                min = gnome_rr_output_get_backlight_min (output);
-                max = gnome_rr_output_get_backlight_max (output);
-                now = gnome_rr_output_get_backlight (output, error);
-                if (now < 0)
-                       goto out;
-                step = BRIGHTNESS_STEP_AMOUNT (max - min + 1);
-                discrete = MAX (now - step, 0);
-                ret = gnome_rr_output_set_backlight (output,
-                                                     discrete,
-                                                     error);
-                if (ret)
-                        percentage_value = ABS_TO_PERCENTAGE (min, max, discrete);
-                goto out;
         }
 
         /* fall back to the polkit helper */
-        now = backlight_helper_get_value ("get-brightness", error);
+        now = backlight_helper_get_value ("get-brightness", manager, error);
         if (now < 0)
                 goto out;
-        max = backlight_helper_get_value ("get-max-brightness", error);
+        max = backlight_helper_get_value ("get-max-brightness", manager, error);
         if (max < 0)
                 goto out;
         step = BRIGHTNESS_STEP_AMOUNT (max - min + 1);
         discrete = MAX (now - step, 0);
         ret = backlight_helper_set_value ("set-brightness",
                                           discrete,
+                                          manager,
                                           error);
         if (ret)
                 percentage_value = ABS_TO_PERCENTAGE (min, max, discrete);
@@ -2860,18 +2806,22 @@ backlight_set_abs (CsdPowerManager *manager,
         GnomeRROutput *output;
         gboolean ret = FALSE;
 
-        /* prefer xbacklight */
-        output = get_primary_output (manager);
-        if (output != NULL) {
-                ret = gnome_rr_output_set_backlight (output,
-                                                     value,
-                                                     error);
-                goto out;
+        /* prioritize user override settings */
+        if (!manager->priv->backlight_helper_force)
+        {
+                /* prefer xbacklight */
+                output = get_primary_output (manager);
+                if (output != NULL) {
+                        ret = gnome_rr_output_set_backlight (output,
+                                                             value,
+                                                             error);
+                        goto out;
+                }
         }
-
         /* fall back to the polkit helper */
         ret = backlight_helper_set_value ("set-brightness",
                                           value,
+                                          manager,
                                           error);
 out:
         if (ret && emit_changed)
@@ -3527,30 +3477,6 @@ lock_screensaver (CsdPowerManager *manager)
         if (!do_lock)
                 return;
 
-            /* connect to the screensaver first */
-            g_dbus_proxy_new_for_bus (G_BUS_TYPE_SESSION,
-                                      G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
-                                      NULL,
-                                      GS_DBUS_NAME,
-                                      GS_DBUS_PATH,
-                                      GS_DBUS_INTERFACE,
-                                      NULL,
-                                      sleep_cb_screensaver_proxy_ready_cb,
-                                      manager);
-}
-
-static void
-upower_notify_sleep_cb (UpClient *client,
-                        UpSleepKind sleep_kind,
-                        CsdPowerManager *manager)
-{
-        gboolean do_lock;
-
-        do_lock = g_settings_get_boolean (manager->priv->settings,
-                                          "lock-on-suspend");
-        if (!do_lock)
-                return;
-
         /* connect to the screensaver first */
         g_dbus_proxy_new_for_bus (G_BUS_TYPE_SESSION,
                                   G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
@@ -3561,46 +3487,6 @@ upower_notify_sleep_cb (UpClient *client,
                                   NULL,
                                   sleep_cb_screensaver_proxy_ready_cb,
                                   manager);
-
-}
-
-static void
-upower_notify_resume_cb (UpClient *client,
-                         UpSleepKind sleep_kind,
-                         CsdPowerManager *manager)
-{
-        gboolean ret;
-        GError *error = NULL;
-
-        /* this displays the unlock dialogue so the user doesn't have
-         * to move the mouse or press any key before the window comes up */
-        if (manager->priv->screensaver_proxy != NULL) {
-                g_dbus_proxy_call (manager->priv->screensaver_proxy,
-                                   "SimulateUserActivity",
-                                   NULL,
-                                   G_DBUS_CALL_FLAGS_NONE,
-                                   -1, NULL, NULL, NULL);
-        }
-
-        if (manager->priv->screensaver_proxy != NULL) {
-            g_object_unref (manager->priv->screensaver_proxy);
-            manager->priv->screensaver_proxy = NULL;
-        }
-
-        /* close existing notifications on resume, the system power
-         * state is probably different now */
-        notify_close_if_showing (manager->priv->notification_low);
-        notify_close_if_showing (manager->priv->notification_discharging);
-
-        /* ensure we turn the panel back on after resume */
-        ret = gnome_rr_screen_set_dpms_mode (manager->priv->x11_screen,
-                                             GNOME_RR_DPMS_ON,
-                                             &error);
-        if (!ret) {
-                g_warning ("failed to turn the panel on after resume: %s",
-                           error->message);
-                g_error_free (error);
-        }
 }
 
 static void
@@ -3663,6 +3549,9 @@ engine_settings_key_changed_cb (GSettings *settings,
                                 const gchar *key,
                                 CsdPowerManager *manager)
 {
+        /* note: you *have* to check if your key was changed here before
+         * doing anything here. this gets invoked on module stop, and
+         * will crash c-s-d if you don't. */
         if (g_strcmp0 (key, "use-time-for-policy") == 0) {
                 manager->priv->use_time_primary = g_settings_get_boolean (settings, key);
                 return;
@@ -3674,6 +3563,11 @@ engine_settings_key_changed_cb (GSettings *settings,
         if (g_str_has_prefix (key, "sleep-inactive") ||
             g_str_has_prefix (key, "sleep-display")) {
                 idle_configure (manager);
+                return;
+        }
+
+        if (g_str_has_prefix (key, "backlight-helper")) {
+                backlight_override_settings_refresh (manager);
                 return;
         }
 }
@@ -3759,6 +3653,229 @@ disable_builtin_screensaver (gpointer unused)
         return TRUE;
 }
 
+static void
+inhibit_lid_switch_done (GObject      *source,
+                         GAsyncResult *result,
+                         gpointer      user_data)
+{
+        GDBusProxy *proxy = G_DBUS_PROXY (source);
+        CsdPowerManager *manager = CSD_POWER_MANAGER (user_data);
+        GError *error = NULL;
+        GVariant *res;
+        GUnixFDList *fd_list = NULL;
+        gint idx;
+
+        res = g_dbus_proxy_call_with_unix_fd_list_finish (proxy, &fd_list, result, &error);
+        if (res == NULL) {
+                g_warning ("Unable to inhibit lid switch: %s", error->message);
+                g_error_free (error);
+        } else {
+                g_variant_get (res, "(h)", &idx);
+                manager->priv->inhibit_lid_switch_fd = g_unix_fd_list_get (fd_list, idx, &error);
+                if (manager->priv->inhibit_lid_switch_fd == -1) {
+                        g_warning ("Failed to receive system inhibitor fd: %s", error->message);
+                        g_error_free (error);
+                }
+                g_debug ("System inhibitor fd is %d", manager->priv->inhibit_lid_switch_fd);
+                g_object_unref (fd_list);
+                g_variant_unref (res);
+        }
+}
+
+static void
+inhibit_lid_switch (CsdPowerManager *manager)
+{
+        GVariant *params;
+
+        if (manager->priv->inhibit_lid_switch_taken) {
+                g_debug ("already inhibited lid-switch");
+                return;
+        }
+        g_debug ("Adding lid switch system inhibitor");
+        manager->priv->inhibit_lid_switch_taken = TRUE;
+
+        params = g_variant_new ("(ssss)",
+                                "handle-lid-switch",
+                                g_get_user_name (),
+                                "Multiple displays attached",
+                                "block");
+        g_dbus_proxy_call_with_unix_fd_list (manager->priv->logind_proxy,
+                                             "Inhibit",
+                                             params,
+                                             0,
+                                             G_MAXINT,
+                                             NULL,
+                                             NULL,
+                                             inhibit_lid_switch_done,
+                                             manager);
+}
+
+static void
+inhibit_suspend_done (GObject      *source,
+                      GAsyncResult *result,
+                      gpointer      user_data)
+{
+        GDBusProxy *proxy = G_DBUS_PROXY (source);
+        CsdPowerManager *manager = CSD_POWER_MANAGER (user_data);
+        GError *error = NULL;
+        GVariant *res;
+        GUnixFDList *fd_list = NULL;
+        gint idx;
+
+        res = g_dbus_proxy_call_with_unix_fd_list_finish (proxy, &fd_list, result, &error);
+        if (res == NULL) {
+                g_warning ("Unable to inhibit suspend: %s", error->message);
+                g_error_free (error);
+        } else {
+                g_variant_get (res, "(h)", &idx);
+                manager->priv->inhibit_suspend_fd = g_unix_fd_list_get (fd_list, idx, &error);
+                if (manager->priv->inhibit_suspend_fd == -1) {
+                        g_warning ("Failed to receive system inhibitor fd: %s", error->message);
+                        g_error_free (error);
+                }
+                g_debug ("System inhibitor fd is %d", manager->priv->inhibit_suspend_fd);
+                g_object_unref (fd_list);
+                g_variant_unref (res);
+        }
+}
+
+/* We take a delay inhibitor here, which causes logind to send a
+ * PrepareToSleep signal, which gives us a chance to lock the screen
+ * and do some other preparations.
+ */
+static void
+inhibit_suspend (CsdPowerManager *manager)
+{
+        if (manager->priv->inhibit_suspend_taken) {
+                g_debug ("already inhibited lid-switch");
+                return;
+        }
+        g_debug ("Adding suspend delay inhibitor");
+        manager->priv->inhibit_suspend_taken = TRUE;
+        g_dbus_proxy_call_with_unix_fd_list (manager->priv->logind_proxy,
+                                             "Inhibit",
+                                             g_variant_new ("(ssss)",
+                                                            "sleep",
+                                                            g_get_user_name (),
+                                                            "Cinnamon needs to lock the screen",
+                                                            "delay"),
+                                             0,
+                                             G_MAXINT,
+                                             NULL,
+                                             NULL,
+                                             inhibit_suspend_done,
+                                             manager);
+}
+
+static void
+uninhibit_suspend (CsdPowerManager *manager)
+{
+        if (manager->priv->inhibit_suspend_fd == -1) {
+                g_debug ("no suspend delay inhibitor");
+                return;
+        }
+        g_debug ("Removing suspend delay inhibitor");
+        close (manager->priv->inhibit_suspend_fd);
+        manager->priv->inhibit_suspend_fd = -1;
+        manager->priv->inhibit_suspend_taken = FALSE;
+}
+
+static void
+handle_suspend_actions (CsdPowerManager *manager)
+{
+        gboolean do_lock;
+
+        do_lock = g_settings_get_boolean (manager->priv->settings,
+                                          "lock-on-suspend");
+        if (do_lock)
+                g_dbus_proxy_new_for_bus (G_BUS_TYPE_SESSION,
+                                          G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+                                          NULL,
+                                          GS_DBUS_NAME,
+                                          GS_DBUS_PATH,
+                                          GS_DBUS_INTERFACE,
+                                          NULL,
+                                          sleep_cb_screensaver_proxy_ready_cb,
+                                          manager);
+
+        /* lift the delay inhibit, so logind can proceed */
+        uninhibit_suspend (manager);
+}
+
+static void
+handle_resume_actions (CsdPowerManager *manager)
+{
+        gboolean ret;
+        GError *error = NULL;
+
+        /* this displays the unlock dialogue so the user doesn't have
+         * to move the mouse or press any key before the window comes up */
+        g_dbus_connection_call (manager->priv->connection,
+                                GS_DBUS_NAME,
+                                GS_DBUS_PATH,
+                                GS_DBUS_INTERFACE,
+                                "SimulateUserActivity",
+                                NULL, NULL,
+                                G_DBUS_CALL_FLAGS_NONE, -1,
+                                NULL, NULL, NULL);
+
+        /* close existing notifications on resume, the system power
+         * state is probably different now */
+        notify_close_if_showing (manager->priv->notification_low);
+        notify_close_if_showing (manager->priv->notification_discharging);
+
+        /* ensure we turn the panel back on after resume */
+        ret = gnome_rr_screen_set_dpms_mode (manager->priv->x11_screen,
+                                             GNOME_RR_DPMS_ON,
+                                             &error);
+        if (!ret) {
+                g_warning ("failed to turn the panel on after resume: %s",
+                           error->message);
+                g_error_free (error);
+        }
+
+        /* set up the delay again */
+        inhibit_suspend (manager);
+}
+
+#if ! UP_CHECK_VERSION(0,99,0)
+static void
+upower_notify_sleep_cb (UpClient *client,
+                        UpSleepKind sleep_kind,
+                        CsdPowerManager *manager)
+{
+        handle_suspend_actions (manager);
+}
+
+static void
+upower_notify_resume_cb (UpClient *client,
+                         UpSleepKind sleep_kind,
+                         CsdPowerManager *manager)
+{
+        handle_resume_actions (manager);
+}
+#endif
+
+static void
+logind_proxy_signal_cb (GDBusProxy  *proxy,
+                        const gchar *sender_name,
+                        const gchar *signal_name,
+                        GVariant    *parameters,
+                        gpointer     user_data)
+{
+        CsdPowerManager *manager = CSD_POWER_MANAGER (user_data);
+        gboolean is_about_to_suspend;
+
+        if (g_strcmp0 (signal_name, "PrepareForSleep") != 0)
+                return;
+        g_variant_get (parameters, "(b)", &is_about_to_suspend);
+        if (is_about_to_suspend) {
+                handle_suspend_actions (manager);
+        } else {
+                handle_resume_actions (manager);
+        }
+}
+
 static gboolean
 is_hardware_a_virtual_machine (void)
 {
@@ -3824,6 +3941,26 @@ csd_power_manager_start (CsdPowerManager *manager,
         if (manager->priv->x11_screen == NULL)
                 return FALSE;
 
+        /* Set up the logind proxy */
+        manager->priv->logind_proxy =
+                g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SYSTEM,
+                                               0,
+                                               NULL,
+                                               SYSTEMD_DBUS_NAME,
+                                               SYSTEMD_DBUS_PATH,
+                                               SYSTEMD_DBUS_INTERFACE,
+                                               NULL,
+                                               error);
+        g_signal_connect (manager->priv->logind_proxy, "g-signal",
+                          G_CALLBACK (logind_proxy_signal_cb),
+                          manager);
+
+        /* Set up a delay inhibitor to be informed about suspend attempts */
+        inhibit_suspend (manager);
+
+        /* Disable logind's lid handling while g-s-d is active */
+        inhibit_lid_switch (manager);
+
         /* track the active session */
         manager->priv->session = cinnamon_settings_session_new ();
         g_signal_connect (manager->priv->session, "notify::state",
@@ -3838,10 +3975,12 @@ csd_power_manager_start (CsdPowerManager *manager,
                           G_CALLBACK (engine_settings_key_changed_cb), manager);
         manager->priv->settings_screensaver = g_settings_new ("org.cinnamon.desktop.screensaver");
         manager->priv->up_client = up_client_new ();
+#if ! UP_CHECK_VERSION(0,99,0)
         g_signal_connect (manager->priv->up_client, "notify-sleep",
                           G_CALLBACK (upower_notify_sleep_cb), manager);
         g_signal_connect (manager->priv->up_client, "notify-resume",
                           G_CALLBACK (upower_notify_resume_cb), manager);
+#endif
         manager->priv->lid_is_closed = up_client_get_lid_is_closed (manager->priv->up_client);
         g_signal_connect (manager->priv->up_client, "device-added",
                           G_CALLBACK (engine_device_added_cb), manager);
@@ -3849,8 +3988,13 @@ csd_power_manager_start (CsdPowerManager *manager,
                           G_CALLBACK (engine_device_removed_cb), manager);
         g_signal_connect (manager->priv->up_client, "device-changed",
                           G_CALLBACK (engine_device_changed_cb), manager);
+#if UP_CHECK_VERSION(0,99,0)
+        g_signal_connect_after (manager->priv->up_client, "notify::lid-is-closed",
+                                G_CALLBACK (lid_state_changed_cb), manager);
+#else
         g_signal_connect_after (manager->priv->up_client, "changed",
                                 G_CALLBACK (up_client_changed_cb), manager);
+#endif
 
         /* use the fallback name from gnome-power-manager so the shell
          * blocks this, and uses the power extension instead */
@@ -3925,6 +4069,10 @@ csd_power_manager_start (CsdPowerManager *manager,
                       "is-present", TRUE,
                       NULL);
 
+        /* get backlight setting overrides */
+        manager->priv->backlight_helper_preference_args = NULL;
+        backlight_override_settings_refresh (manager);
+
         /* get percentage policy */
         manager->priv->low_percentage = g_settings_get_int (manager->priv->settings,
                                                             "percentage-low");
@@ -3966,6 +4114,17 @@ csd_power_manager_start (CsdPowerManager *manager,
 
         /* set the initial dim time that can adapt for the user */
         refresh_idle_dim_settings (manager);
+
+        /* Make sure that Xorg's DPMS extension never gets in our way. The defaults seem to have changed in Xorg 1.14
+         * being "0" by default to being "600" by default 
+         * https://bugzilla.gnome.org/show_bug.cgi?id=709114
+         */
+        gdk_error_trap_push ();
+        int dummy;
+        if (DPMSQueryExtension(GDK_DISPLAY_XDISPLAY (gdk_display_get_default ()), &dummy, &dummy)) {
+            DPMSSetTimeouts (GDK_DISPLAY_XDISPLAY (gdk_display_get_default ()), 0, 0, 0);
+        }
+        gdk_error_trap_pop_ignored ();
 
         manager->priv->xscreensaver_watchdog_timer_id = g_timeout_add_seconds (XSCREENSAVER_WATCHDOG_TIMEOUT,
                                                                                disable_builtin_screensaver,
@@ -4021,6 +4180,25 @@ csd_power_manager_stop (CsdPowerManager *manager)
                 g_object_unref (manager->priv->up_client);
                 manager->priv->up_client = NULL;
         }
+
+        if (manager->priv->inhibit_lid_switch_fd != -1) {
+                close (manager->priv->inhibit_lid_switch_fd);
+                manager->priv->inhibit_lid_switch_fd = -1;
+                manager->priv->inhibit_lid_switch_taken = FALSE;
+        }
+        if (manager->priv->inhibit_suspend_fd != -1) {
+                close (manager->priv->inhibit_suspend_fd);
+                manager->priv->inhibit_suspend_fd = -1;
+                manager->priv->inhibit_suspend_taken = FALSE;
+        }
+
+        if (manager->priv->logind_proxy != NULL) {
+                g_object_unref (manager->priv->logind_proxy);
+                manager->priv->logind_proxy = NULL;
+        }
+
+        g_free (manager->priv->backlight_helper_preference_args);
+        manager->priv->backlight_helper_preference_args = NULL;
 
         if (manager->priv->x11_screen != NULL) {
                 g_object_unref (manager->priv->x11_screen);
@@ -4094,6 +4272,8 @@ static void
 csd_power_manager_init (CsdPowerManager *manager)
 {
         manager->priv = CSD_POWER_MANAGER_GET_PRIVATE (manager);
+        manager->priv->inhibit_lid_switch_fd = -1;
+        manager->priv->inhibit_suspend_fd = -1;
 }
 
 static void
