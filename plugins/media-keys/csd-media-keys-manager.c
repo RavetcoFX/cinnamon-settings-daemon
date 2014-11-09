@@ -1660,7 +1660,15 @@ do_action (CsdMediaKeysManager *manager,
                 do_media_action (manager, timestamp);
                 break;
         case C_DESKTOP_MEDIA_KEY_CALCULATOR:
-                do_execute_desktop (manager, "gcalctool.desktop", timestamp);
+                if ((cmd = g_find_program_in_path ("gnome-calculator"))) {
+                execute (manager, "gnome-calculator", FALSE);
+                } else if ((cmd = g_find_program_in_path ("galculator"))) {
+                execute (manager, "galculator", FALSE);
+                } else {
+                execute (manager, "mate-calc", FALSE);
+                }
+
+                g_free (cmd);
                 break;
         case C_DESKTOP_MEDIA_KEY_PLAY:
                 return do_multimedia_player_action (manager, NULL, "Play");
@@ -1784,15 +1792,6 @@ start_media_keys_idle_cb (CsdMediaKeysManager *manager)
 	manager->priv->icon_theme = g_settings_get_string (manager->priv->interface_settings, "icon-theme");
 
         init_screens (manager);
-
-        GSettings *settings = g_settings_new ("org.cinnamon.sounds");
-        gboolean enabled = g_settings_get_boolean(settings, "login-enabled");
-        gchar *sound = g_settings_get_string (settings, "login-file");
-        if (enabled) {
-            ca_context_play (manager->priv->ca, 1, CA_PROP_MEDIA_FILENAME, sound, NULL);
-        }
-        g_free(sound);
-        g_object_unref (settings);
 
         g_debug ("Starting mpris controller");
         manager->priv->mpris_controller = mpris_controller_new ();
